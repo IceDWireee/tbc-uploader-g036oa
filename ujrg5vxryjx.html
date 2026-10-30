@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TBC ZIP Uploader v2</title>
+<style>
+body{font:16px -apple-system,system-ui,sans-serif;margin:0;padding:16px;background:#0f1115;color:#e8eaed}
+h1{font-size:20px;margin:0 0 6px}
+.sub{font-size:13px;color:#8b95a5;margin-bottom:14px;line-height:1.4}
+label{display:block;margin:12px 0 5px;font-size:13px;color:#9aa4b2}
+input{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;border:1px solid #2b3444;background:#161a22;color:#e8eaed;font-size:16px}
+button{width:100%;padding:15px;margin-top:18px;border:0;border-radius:12px;background:#2f6fed;color:#fff;font-size:17px;font-weight:600}
+button:disabled{opacity:.5}
+pre{white-space:pre-wrap;word-break:break-word;background:#10151d;border:1px solid #232b39;border-radius:10px;padding:12px;font-size:13px;margin-top:16px;max-height:46vh;overflow:auto}
+.note{font-size:12px;color:#8b95a5;margin-top:16px;line-height:1.55}
+</style>
+</head>
+<body>
+<h1>Загрузка ZIP в GitHub</h1>
+<div class="sub">Архив режется на части по 8 MB и уходит в репозиторий через Git Data API: сначала blobs, потом один коммит. Обрыв связи безопасен — уже загруженные части пропускаются.</div>
+<label>Токен GitHub</label>
+<input id="tok" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ghp_... (classic, scopes repo)">
+<label>Владелец (owner)</label>
+<input id="own" autocapitalize="off" spellcheck="false">
+<label>Репозиторий</label>
+<input id="rep" autocapitalize="off" spellcheck="false">
+<label>Ветка</label>
+<input id="br" value="main" autocapitalize="off" spellcheck="false">
+<label>ZIP из приложения «Файлы»</label>
+<input id="f" type="file" accept=".zip,application/zip,application/x-zip-compressed">
+<button id="btn">Проверить доступ</button>
+<pre id="log"></pre>
+<div class="note">Токен хранится только в памяти страницы и отправляется исключительно на api.github.com. Он не пишется в адрес, в лог и на сторонние серверы.</div>
+<script>
+var TOKEN = '';
+var OWNER = '';
+var REPO = '';
+var BR = 'main';
+var CH = 8 * 1024 * 1024;
+var BATCH = 4;
+
+function el(i) { return document.getElementById(i); }
+function nl() { return String.fromCharCode(10); }
+function say(t) { var a = el('log'); a.textContent = a.textContent + t + nl(); a.scrollTop = a.scrollHeight; }
+function pad(n) { var s = String(n); while (s.length < 3) { s = '0' + s; } return s; }
+function mb(n) { return (n / 1048576).toFixed(2) + ' MB'; }
+
+function b64(u8) {
+  var s = '';
+  var step = 8192;
+  for (var i = 0; i < u8.length; i += step) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
+  }
+  return btoa(s);
+}
+
+function hex(buf) {
+  return crypto.subtle.digest('SHA-256', buf).then(function (d) {
+    var a = new Uint8Array(d);
+    var o = '';
+    for (var i = 0; i < a.length; i++) { o += ('0' + a[i].toString(16)).slice(-2); }
+    return o;
+  });
+}
+
+function readSlice(blob) {
+  if (blob.arrayBuffer) { return blob.arrayBuffer(); }
+  return new Promise(function (res, rej) {
+    var fr = new FileReader();
+    fr.onload = function () { res(fr.result); };
+    fr.onerror = function () { rej(new Error('не смог прочитать фрагмент файла')); };
+    fr.readAsArrayBuffer(blob);
+  });
+}
+
+function gh(path, method, body) {
+  var opt = {
+    method: method || 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + TOKEN,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    }
+  };
+  if (body) { opt.body = JSON.stringify(body); }
+  return fetch('https://api.github.com' + path, opt).then(function (r) {
+    return r.text().then(function (t) {
+      var j = null;
+      try { j = JSON.parse(t); } catch (e) { j = null; }
+      return { s: r.status, j: j, t: t };
+    });
+  });
+}
+
+function gm(res) {
+  if (res.j && res.j.message) { return res.j.message; }
+  return String(res.t || '').slice(0, 140);
+}
+
+function fail(what, res) {
+  var e = new Error(what + ' -> HTTP ' + res.s + ' · ' + gm(res));
+  return e;
+}
+
+async function getHead() {
+  var r = await gh('/repos/' + OWNER + '/' + REPO + '/git/ref/heads/' + BR);
+  if (r.s === 200 && r.j && r.j.object) { return r.j.object.sha; }
+  if (r.s === 404) { return null; }
+  throw fail('чтение ветки ' + BR, r);
+}
+
+async function treeOf(commitSha) {
+  var r = await gh('/repos/' + OWNER + '/' + REPO + '/git/commits/' + commitSha);
+  if (r.s === 200 && r.j && r.j.tree) { return r.j.tree.sha; }
+  throw fail('чтение коммита', r);
+}
+
+async function putBlob(u8) {
+  var last = null;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) { await new Promise(function (z) { setTimeout(z, 900 * attempt); }); }
+    var r = await gh('/repos/' + OWNER + '/' + REPO + '/git/blobs', 'POST', { content: b64(u8), encoding: 'base64' });
+    if (r.s === 201 || r.s === 200) { return r.j.sha; }
+    last = fail('загрузка blob', r);
+    if (r.s !== 502 && r.s !== 503 && r.s !== 504 && r.s !== 429) { break; }
+  }
+  throw last;
+}
+
+async function commitEntries(entries, message) {
+  for (var attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      say('  ветка сдвинулась, повторяю коммит (' + attempt + '/4)');
+      await new Promise(function (z) { setTimeout(z, 1500 * attempt); });
+    }
+    var head = await getHead();
+    var base = null;
+    if (head) { base = await treeOf(head); }
+    var body = {};
+    if (base) { body.base_tree = base; }
+    body.tree = entries;
+    var tr = await gh('/repos/' + OWNER + '/' + REPO + '/git/trees', 'POST', body);
+    if (!(tr.s === 201 || tr.s === 200)) { throw fail('создание tree', tr); }
+    var cbody = { message: message, tree: tr.j.sha };
+    if (head) { cbody.parents = [head]; }
+    var cm = await gh('/repos/' + OWNER + '/' + REPO + '/git/commits', 'POST', cbody);
+    if (!(cm.s === 201 || cm.s === 200)) { throw fail('создание коммита', cm); }
+    if (head) {
+      var up = await gh('/repos/' + OWNER + '/' + REPO + '/git/refs/heads/' + BR, 'PATCH', { sha: cm.j.sha, force: false });
+      if (up.s === 200 || up.s === 201) { return cm.j.sha; }
+      if (up.s === 422 || up.s === 409) { continue; }
+      throw fail('обновление ветки', up);
+    }
+    var cr = await gh('/repos/' + OWNER + '/' + REPO + '/git/refs', 'POST', { ref: 'refs/heads/' + BR, sha: cm.j.sha });
+    if (cr.s === 201 || cr.s === 200) { return cm.j.sha; }
+    if (cr.s === 422) { continue; }
+    throw fail('создание ветки', cr);
+  }
+  throw new Error('не удалось записать коммит: ветку постоянно сдвигают другие процессы');
+}
+
+async function existingParts() {
+  var have = {};
+  for (var page = 1; page <= 10; page++) {
+    var r = await gh('/repos/' + OWNER + '/' + REPO + '/contents/parts?ref=' + BR + '&per_page=100&page=' + page);
+    if (r.s === 404) { return have; }
+    if (r.s !== 200 || !r.j || !r.j.length) { return have; }
+    for (var i = 0; i < r.j.length; i++) {
+      var it = r.j[i];
+      if (it && it.name && it.name.indexOf('.bin') > 0) { have[it.name] = it.size; }
+    }
+    if (r.j.length < 100) { return have; }
+  }
+  return have;
+}
+
+async function run() {
+  TOKEN = el('tok').value.trim();
+  OWNER = el('own').value.trim();
+  REPO = el('rep').value.trim();
+  BR = el('br').value.trim() || 'main';
+  if (!TOKEN || !OWNER || !REPO) { say('Заполни токен, owner и repo.'); return; }
+  el('btn').disabled = true;
+  el('log').textContent = '';
+
+  try {
+    if (TOKEN.length < 20) { say('Токен слишком короткий — похоже, скопировался не полностью.'); return; }
+
+    say('1) Проверяю токен...');
+    var me = await gh('/user');
+    if (me.s === 401) { say('Токен неверный или просрочен (401).'); return; }
+    if (me.s !== 200) { say('Не смог прочитать /user: HTTP ' + me.s + ' · ' + gm(me)); return; }
+    say('   вошёл как @' + me.j.login);
+
+    say('2) Проверяю репозиторий...');
+    var rp = await gh('/repos/' + OWNER + '/' + REPO);
+    if (rp.s === 404) { say('Репозиторий ' + OWNER + '/' + REPO + ' не найден (404) или у токена нет к нему доступа.'); return; }
+    if (rp.s !== 200) { say('Репозиторий: HTTP ' + rp.s + ' · ' + gm(rp)); return; }
+    say('   ' + OWNER + '/' + REPO + ' · приватный: ' + (rp.j.private ? 'да' : 'нет') + ' · ветка по умолчанию: ' + rp.j.default_branch);
+
+    say('3) Проверяю права на запись (тестовый blob)...');
+    var probe = await putBlob(new TextEncoder().encode('tbc uploader probe ' + Date.now()));
+    say('   запись работает, blob ' + probe.slice(0, 10));
+
+    var f = el('f').files[0];
+    if (!f) { say('Шаги 1-3 пройдены. Теперь выбери ZIP в поле выше и запусти снова.'); return; }
+    say('4) Файл: ' + f.name + ' · ' + mb(f.size));
+    if (f.size < 22) { say('   файл слишком мал для ZIP, остановлено.'); return; }
+    var sig = new Uint8Array(await readSlice(f.slice(0, 2)));
+    if (sig[0] !== 80 || sig[1] !== 75) { say('   это не ZIP: нет сигнатуры PK, остановлено.'); return; }
+    say('   сигнатура ZIP: ок');
+
+    var total = Math.ceil(f.size / CH);
+    say('   частей: ' + total + ' по 8 MB');
+
+    var have = await existingParts();
+    var hk = Object.keys(have);
+    say('   уже в репозитории частей: ' + hk.length);
+
+    var man = [];
+    var pending = [];
+    var done = 0;
+    var i = 0;
+
+    async function flush(batchNo) {
+      if (!pending.length) { return; }
+      var list = pending;
+      pending = [];
+      var sha = await commitEntries(list, 'Parts batch ' + batchNo + ' [tbc artifacts]');
+      say('   коммит партии ' + batchNo + ': ' + sha.slice(0, 10) + ' · файлов ' + list.length);
+    }
+
+    var batchNo = 1;
+    for (i = 0; i < total; i++) {
+      var name = 'part_' + pad(i) + '.bin';
+      var start = i * CH;
+      var end = Math.min(f.size, start + CH);
+      var buf = await readSlice(f.slice(start, end));
+      var u8 = new Uint8Array(buf);
+      var hh = await hex(buf);
+      man.push(hh + '  ' + name);
+      if (have[name] === u8.length) {
+        done = done + 1;
+        say('   ' + (i + 1) + '/' + total + ' ' + name + ' уже был, пропуск');
+        continue;
+      }
+      var bsha = await putBlob(u8);
+      pending.push({ path: 'parts/' + name, mode: '100644', type: 'blob', sha: bsha });
+      done = done + 1;
+      say('   ' + (i + 1) + '/' + total + ' ' + name + ' ' + mb(u8.length) + ' → blob ' + bsha.slice(0, 8));
+      if (pending.length >= BATCH) {
+        await flush(batchNo);
+        batchNo = batchNo + 1;
+      }
+    }
+    await flush(batchNo);
+
+    say('5) Записываю размер и манифест SHA-256...');
+    var sizeBlob = await putBlob(new TextEncoder().encode(String(f.size)));
+    var manText = man.join(nl()) + nl();
+    var manBlob = await putBlob(new TextEncoder().encode(manText));
+    var fin = await commitEntries([
+      { path: 'parts/expected_size.txt', mode: '100644', type: 'blob', sha: sizeBlob },
+      { path: 'parts/manifest.sha256', mode: '100644', type: 'blob', sha: manBlob }
+    ], 'Upload parts manifest [tbc artifacts]');
+    say('   финальный коммит: ' + fin.slice(0, 10));
+
+    say('6) Проверяю, что манифест действительно лежит в репозитории...');
+    var chk = await gh('/repos/' + OWNER + '/' + REPO + '/contents/parts/manifest.sha256?ref=' + BR);
+    if (chk.s === 200) {
+      say('   ПОДТВЕРЖДЕНО: manifest.sha256 на месте, размер ' + chk.j.size + ' байт');
+      say('');
+      say('Готово. Загружено частей: ' + done + ' из ' + total + '.');
+      say('Сборка запустится сама. Вернись в бота и нажми «Получить результат».');
+    } else {
+      say('   манифест не читается: HTTP ' + chk.s + ' · ' + gm(chk));
+      say('   коммит прошёл, но файл не виден — проверь ветку ' + BR);
+    }
+  } catch (e) {
+    say('');
+    say('ОШИБКА: ' + e.message);
+    if (String(e.message).indexOf('404') > 0) { say('Подсказка: проверь owner, repo и ветку — либо у токена нет прав на этот репозиторий.'); }
+    if (String(e.message).indexOf('403') > 0) { say('Подсказка: токену не хватает прав. Нужен classic PAT со scope repo.'); }
+    if (String(e.message).indexOf('401') > 0) { say('Подсказка: токен неверный или отозван.'); }
+    say('Нажми кнопку снова — уже загруженные части пропустятся.');
+  } finally {
+    el('btn').disabled = false;
+  }
+}
+
+function probe() {
+  el('log').textContent = '';
+  run();
+}
+
+var q = new URLSearchParams(location.search);
+if (q.get('o')) { el('own').value = q.get('o'); }
+if (q.get('r')) { el('rep').value = q.get('r'); }
+if (q.get('b')) { el('br').value = q.get('b'); }
+el('btn').addEventListener('click', probe);
+</script>
+</body>
+</html>
